@@ -14,9 +14,9 @@ services:
       - key: ADMIN_ID
         sync: false
       - key: FRONTEND_URL
-        sync: false
+        value: https://minefrontend.vercel.app
       - key: BACKEND_URL
-        sync: false
+        value: https://minebackend-dyyq.onrender.com
       - key: MONGODB_URI1
         sync: false
       - key: MONGODB_URI2
