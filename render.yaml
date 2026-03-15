@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: mines-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: BACKEND_URL
+        sync: false
+      - key: MONGODB_URI1
+        sync: false
+      - key: MONGODB_URI2
+        sync: false
+      - key: ADMIN_KPAY_NUMBER
+        sync: false
+      - key: ADMIN_KPAY_NAME
+        sync: false
+      - key: ADMIN_WAVE_NUMBER
+        sync: false
+      - key: ADMIN_WAVE_NAME
+        sync: false
