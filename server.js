@@ -1201,5 +1201,10 @@ setInterval(() => {
 process.on('unhandledRejection', r => console.error('UnhandledRejection:', r));
 process.on('uncaughtException',  e => console.error('UncaughtException:', e.message));
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Mines backend on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Mines backend running on http://0.0.0.0:${PORT}`);
+  console.log(`   FRONTEND_URL: ${FRONTEND_URL}`);
+  console.log(`   BACKEND_URL:  ${BACKEND_URL}`);
+  console.log(`   MongoDB:      ${isConnected ? 'connected' : 'connecting...'}`);
+});

@@ -1,10 +1,11 @@
 services:
   - type: web
-    name: mines-backend
+    name: minebackend
     runtime: node
     plan: free
     buildCommand: npm install
     startCommand: node server.js
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false
