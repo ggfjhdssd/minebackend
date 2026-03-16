@@ -20,7 +20,7 @@ app.use(express.json());
 
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const ADMIN_ID     = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://minefrontend.vercel.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://minefrontend-9d5ulgmnh-koedjdyud-8526s-projects.vercel.app';
 const BACKEND_URL  = process.env.BACKEND_URL  || 'https://minebackend-dyyq.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME  || 'winnermine_bot';
 
