@@ -453,7 +453,7 @@ app.post('/api/mines/start', async (req, res) => {
     const bet   = parseInt(betAmount);
     const bombs = parseInt(bombCount);
 
-    if (isNaN(bet)   || bet < 100)           return res.status(400).json({ error: 'Bet အနည်းဆုံး 100 MMK' });
+    if (isNaN(bet)   || bet < 1000)           return res.status(400).json({ error: 'အနည်းဆုံး ၁,၀၀၀ ကျပ်မှ စတင်၍ ကစားနိုင်ပါသည်' });
     if (isNaN(bombs) || bombs < 1 || bombs > 24) return res.status(400).json({ error: 'Bomb 1–24 ဖြစ်ရမည်' });
 
     const tid = parseInt(telegramId);
@@ -495,7 +495,7 @@ app.post('/api/mines/start', async (req, res) => {
   } catch(e) { console.error('mines/start err:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-// POST /api/mines/reveal — open a tile
+// POST /api/mines/reveal — open a tile  (Dynamic 5% House Edge)
 app.post('/api/mines/reveal', async (req, res) => {
   try {
     const { gameId, cellIndex, telegramId } = req.body;
@@ -510,15 +510,33 @@ app.post('/api/mines/reveal', async (req, res) => {
     if (!game) return res.status(404).json({ error: 'Active game မတွေ့ပါ' });
     if (game.revealedCells.includes(cell)) return res.status(400).json({ error: 'Cell already opened' });
 
-    const isBomb = game.bombPositions.includes(cell);
+    // ── Dynamic House Edge ────────────────────────────────────────────────
+    // 5% flat chance per click that this tile is a bomb (regardless of board).
+    // If triggered, pick a random unrevealed cell (not the clicked cell) to mark
+    // as the "real" bomb position so the reveal looks consistent to the client.
+    const HOUSE_EDGE_PCT = 0.05;
+    const dynamicBomb = Math.random() < HOUSE_EDGE_PCT;
+
+    // Also honour any pre-placed bomb on this cell from the original board
+    const presetBomb = game.bombPositions.includes(cell);
+
+    const isBomb = dynamicBomb || presetBomb;
 
     if (isBomb) {
+      // If triggered dynamically, make sure the clicked cell appears in bombPositions
+      if (!game.bombPositions.includes(cell)) {
+        game.bombPositions.push(cell);
+      }
+
       // 💣 EXPLODED
-      game.status      = 'exploded';
+      game.status       = 'exploded';
       game.explodedCell = cell;
-      game.winAmount   = 0;
+      game.winAmount    = 0;
       await game.save();
-      await User.findOneAndUpdate({ telegramId: tid }, { $inc: { totalGames: 1, losses: 1, totalWagered: game.betAmount } });
+      await User.findOneAndUpdate(
+        { telegramId: tid },
+        { $inc: { totalGames: 1, losses: 1, totalWagered: game.betAmount } }
+      );
 
       return res.json({
         result: 'bomb', cell,
@@ -529,6 +547,7 @@ app.post('/api/mines/reveal', async (req, res) => {
         status: 'exploded', winAmount: 0
       });
     }
+    // ─────────────────────────────────────────────────────────────────────
 
     // 💵 DIAMOND
     game.revealedCells.push(cell);
@@ -542,7 +561,10 @@ app.post('/api/mines/reveal', async (req, res) => {
       game.status    = 'cashout';
       game.winAmount = winAmount;
       await game.save();
-      await User.findOneAndUpdate({ telegramId: tid }, { $inc: { balance: winAmount, totalGames: 1, wins: 1, totalWon: winAmount, totalWagered: game.betAmount } });
+      await User.findOneAndUpdate(
+        { telegramId: tid },
+        { $inc: { balance: winAmount, totalGames: 1, wins: 1, totalWon: winAmount, totalWagered: game.betAmount } }
+      );
 
       return res.json({
         result: 'diamond', cell,
