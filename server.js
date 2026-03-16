@@ -61,7 +61,15 @@ const userSchema = new mongoose.Schema({
   isBanned:     { type: Boolean, default: false },
   role:         { type: String, enum: ['user','agent'], default: 'user' },
   lastActive:   { type: Date, default: Date.now },
-  createdAt:    { type: Date, default: Date.now }
+  createdAt:    { type: Date, default: Date.now },
+  // 4-level referral commission earnings
+  refEarnings:  {
+    level1: { type: Number, default: 0 },  // Direct invitees' bets
+    level2: { type: Number, default: 0 },
+    level3: { type: Number, default: 0 },
+    level4: { type: Number, default: 0 },
+    total:  { type: Number, default: 0 }
+  }
 });
 userSchema.index({ telegramId: 1 });
 userSchema.index({ referralCode: 1 });
@@ -146,6 +154,8 @@ const agentSchema = new mongoose.Schema({
   agentKpayNumber:       { type: String, default: '' },
   agentKpayName:         { type: String, default: '' },
   hasWave:               { type: Boolean, default: false },
+  agentWaveNumber:       { type: String, default: '' },
+  agentWaveName:         { type: String, default: '' },
   depositCommission:     { type: Number, default: 0, min: 0, max: 50 },
   turnoverCommission:    { type: Number, default: 0, min: 0, max: 10 },
   totalCommissionEarned: { type: Number, default: 0 },
@@ -217,11 +227,69 @@ function calcMultiplier(bombCount, revealed) {
   for (let i = 0; i < revealed; i++) {
     mult *= (TOTAL_TILES - i) / (TOTAL_TILES - bombCount - i);
   }
-  mult *= 0.95;
+  mult *= 0.94; // 6% house edge
   return Math.max(1.01, Math.round(mult * 100) / 100);
 }
 
-// ===== Agent Commission Helper =====
+// ═══════════════════════════════════════════════════════════════════
+// 4-LEVEL REFERRAL COMMISSION SYSTEM
+//
+//  Level 1 (direct inviter of bettor):  1.000% of bet
+//  Level 2 (inviter's inviter):          0.500% of bet
+//  Level 3 (3 levels up):               0.250% of bet
+//  Level 4 (4 levels up):               0.125% of bet
+//
+//  These stack on top of Agent % commission (if the upline is an agent).
+// ═══════════════════════════════════════════════════════════════════
+const REF_RATES = [0.01, 0.005, 0.0025, 0.00125]; // L1 … L4
+
+async function distributeReferralCommission(bettorId, betAmount) {
+  try {
+    let currentId = bettorId;
+
+    for (let level = 0; level < REF_RATES.length; level++) {
+      // Walk up one step in the referral chain
+      const player = await User.findOne({ telegramId: currentId })
+        .select('referredBy').lean();
+      if (!player || !player.referredBy) break; // chain ended
+
+      const uplineId    = player.referredBy;
+      const rate        = REF_RATES[level];
+      const commission  = Math.floor(betAmount * rate);   // floor to integer MMK
+      if (commission <= 0) { currentId = uplineId; continue; }
+
+      const levelKey = `refEarnings.level${level + 1}`;
+
+      // Credit upline balance + track per-level earnings
+      await User.findOneAndUpdate(
+        { telegramId: uplineId },
+        { $inc: { balance: commission, [levelKey]: commission, 'refEarnings.total': commission } }
+      );
+
+      // If upline is an agent, also track in Agent collection
+      const uplineUser = await User.findOne({ telegramId: uplineId })
+        .select('role').lean();
+      if (uplineUser?.role === 'agent') {
+        await Agent.findOneAndUpdate(
+          { telegramId: uplineId },
+          { $inc: { totalCommissionEarned: commission } }
+        );
+      }
+
+      // Telegram notification (non-blocking, only for level 1 to avoid spam)
+      if (bot && level === 0) {
+        bot.telegram.sendMessage(uplineId,
+          `💰 <b>Referral Commission!</b>\n🎮 Level ${level + 1}: <b>+${commission.toLocaleString()} MMK</b>\n(${(rate * 100).toFixed(3)}% of ${betAmount.toLocaleString()} MMK)`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+
+      currentId = uplineId; // move further up the chain
+    }
+  } catch(e) { console.error('distributeReferralCommission err:', e.message); }
+}
+
+// ===== Agent % Commission Helper (Deposit commission for agents) =====
 async function creditAgentCommission(userId, amount, type = 'turnover') {
   try {
     const user = await User.findOne({ telegramId: userId }).select('referredBy').lean();
@@ -245,7 +313,7 @@ async function creditAgentCommission(userId, amount, type = 'turnover') {
     if (bot) {
       const label = type === 'deposit' ? '💵 Deposit' : '🎮 Turnover';
       bot.telegram.sendMessage(user.referredBy,
-        `💰 <b>Commission ရရှိ!</b>\n${label} Commission: <b>+${commission.toLocaleString()} MMK</b>\n(${rate}% of ${amount.toLocaleString()} MMK)`,
+        `💰 <b>Agent Commission ရရှိ!</b>\n${label}: <b>+${commission.toLocaleString()} MMK</b>\n(${rate}% of ${amount.toLocaleString()} MMK)`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
     }
@@ -479,7 +547,10 @@ app.post('/api/mines/start', async (req, res) => {
     const gameId = genGameId();
     await new MinesGame({ gameId, userId: tid, betAmount: bet, bombCount: bombs, serverSeed, hashedServerSeed, clientSeed, bombPositions, revealedCells: [], currentMultiplier: 1, status: 'active', winAmount: 0 }).save();
 
+    // Agent % commission
     creditAgentCommission(tid, bet, 'turnover').catch(() => {});
+    // 4-level referral commission (1% / 0.5% / 0.25% / 0.125%)
+    distributeReferralCommission(tid, bet).catch(() => {});
 
     res.json({
       gameId, hashedServerSeed, clientSeed,
@@ -504,7 +575,7 @@ app.post('/api/mines/reveal', async (req, res) => {
     if (!game) return res.status(404).json({ error: 'Active game မတွေ့ပါ' });
     if (game.revealedCells.includes(cell)) return res.status(400).json({ error: 'Cell already opened' });
 
-    const HOUSE_EDGE_PCT = 0.05;
+    const HOUSE_EDGE_PCT = 0.06; // 6% dynamic house edge
     const dynamicBomb = Math.random() < HOUSE_EDGE_PCT;
     const presetBomb = game.bombPositions.includes(cell);
     const isBomb = dynamicBomb || presetBomb;
@@ -715,8 +786,26 @@ app.post('/api/withdraw', async (req, res) => {
 app.get('/api/referrals/:telegramId', async (req, res) => {
   try {
     const tid = parseInt(req.params.telegramId);
-    const referrals = await User.find({ referredBy: tid }).select('firstName username balance createdAt').sort({ createdAt: -1 }).lean();
-    res.json({ total: referrals.length, referrals: referrals.map(u => ({ name: u.firstName || u.username || `User${u.telegramId}`, username: u.username || '', balance: u.balance || 0, joinedAt: u.createdAt })) });
+    const me  = await User.findOne({ telegramId: tid }).select('refEarnings').lean();
+    const referrals = await User.find({ referredBy: tid })
+      .select('firstName username balance createdAt').sort({ createdAt: -1 }).lean();
+    res.json({
+      total: referrals.length,
+      // Per-level commission summary for this user
+      commissionSummary: {
+        level1: me?.refEarnings?.level1 || 0,
+        level2: me?.refEarnings?.level2 || 0,
+        level3: me?.refEarnings?.level3 || 0,
+        level4: me?.refEarnings?.level4 || 0,
+        total:  me?.refEarnings?.total  || 0
+      },
+      referrals: referrals.map(u => ({
+        name: u.firstName || u.username || `User${u.telegramId}`,
+        username: u.username || '',
+        balance: u.balance || 0,
+        joinedAt: u.createdAt
+      }))
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1002,6 +1091,11 @@ app.get('/api/agent/panel', isAgent, async (req, res) => {
       depositCommission: agent.depositCommission || 0,
       turnoverCommission: agent.turnoverCommission || 0,
       totalCommissionEarned: agent.totalCommissionEarned || 0,
+      agentKpayNumber: agent.agentKpayNumber || '',
+      agentKpayName:   agent.agentKpayName   || '',
+      hasWave:         agent.hasWave         || false,
+      agentWaveNumber: agent.agentWaveNumber || '',
+      agentWaveName:   agent.agentWaveName   || '',
       totalReferrals, totalSales, totalTurnover
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -1010,8 +1104,23 @@ app.get('/api/agent/panel', isAgent, async (req, res) => {
 app.get('/api/agent/referrals', isAgent, async (req, res) => {
   try {
     const referrals = await User.find({ referredBy: req.agentUser.telegramId })
-      .select('firstName username balance createdAt').sort({ createdAt: -1 }).lean();
-    res.json({ total: referrals.length, referrals: referrals.map(u => ({ name: u.firstName || u.username || `User${u.telegramId}`, username: u.username || '', balance: u.balance || 0, joinedAt: u.createdAt })) });
+      .select('telegramId firstName username balance createdAt').sort({ createdAt: -1 }).lean();
+    const enriched = await Promise.all(referrals.map(async u => {
+      const depAgg = await Deposit.aggregate([
+        { $match: { userId: u.telegramId, status: 'confirmed' } },
+        { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }
+      ]);
+      return {
+        telegramId: u.telegramId,
+        name: u.firstName || u.username || `User${u.telegramId}`,
+        username: u.username || '',
+        balance: u.balance || 0,
+        joinedAt: u.createdAt,
+        totalDeposited: depAgg[0]?.total || 0,
+        depositCount: depAgg[0]?.count || 0
+      };
+    }));
+    res.json({ total: enriched.length, referrals: enriched });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1134,7 +1243,7 @@ app.get('/api/payment-info/:telegramId', async (req, res) => {
     if (!user.referredBy) return res.json(defaultInfo);
     const agentDoc = await Agent.findOne({ telegramId: user.referredBy }).lean();
     if (!agentDoc || !agentDoc.agentKpayNumber) return res.json(defaultInfo);
-    res.json({ kpayNumber: agentDoc.agentKpayNumber, kpayName: agentDoc.agentKpayName||'', hasWave: agentDoc.hasWave||false, waveNumber: '', waveName: '', isAgentPayment: true });
+    res.json({ kpayNumber: agentDoc.agentKpayNumber, kpayName: agentDoc.agentKpayName||'', hasWave: agentDoc.hasWave||false, waveNumber: agentDoc.agentWaveNumber||'', waveName: agentDoc.agentWaveName||'', isAgentPayment: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1175,9 +1284,15 @@ app.get('/api/admin/agent-referrals', isAdmin, async (req, res) => {
         agentId: agent.telegramId,
         agentName: agent.firstName || agent.username || `Agent${agent.telegramId}`,
         agentBalance: agent.balance || 0,
+        agentRefCode: agent.referralCode || '',
         depositCommission: agentDoc?.depositCommission || 0,
         turnoverCommission: agentDoc?.turnoverCommission || 0,
         totalCommissionEarned: agentDoc?.totalCommissionEarned || 0,
+        agentKpayNumber: agentDoc?.agentKpayNumber || '',
+        agentKpayName: agentDoc?.agentKpayName || '',
+        hasWave: agentDoc?.hasWave || false,
+        agentWaveNumber: agentDoc?.agentWaveNumber || '',
+        agentWaveName: agentDoc?.agentWaveName || '',
         totalReferrals: referredUsers.length, activeReferrals: activeCount, totalSales,
         referrals: referredUsers.map(u => ({ telegramId: u.telegramId, name: u.firstName || u.username || `User${u.telegramId}`, username: u.username || '', balance: u.balance || 0, joinedAt: u.createdAt }))
       };
@@ -1217,9 +1332,9 @@ app.post('/api/admin/agents/:tid/commission', isAdmin, async (req, res) => {
 app.post('/api/admin/agents/:tid/payment-info', isAdmin, async (req, res) => {
   try {
     const tid = parseInt(req.params.tid);
-    const { kpayNumber, kpayName, hasWave } = req.body;
+    const { kpayNumber, kpayName, hasWave, waveNumber, waveName } = req.body;
     if (!kpayNumber) return res.status(400).json({ error: 'KPay နံပါတ် လိုသည်' });
-    const agent = await Agent.findOneAndUpdate({ telegramId: tid }, { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName||'', hasWave: !!hasWave } }, { new: true, upsert: false });
+    const agent = await Agent.findOneAndUpdate({ telegramId: tid }, { $set: { agentKpayNumber: kpayNumber, agentKpayName: kpayName||'', hasWave: !!hasWave, agentWaveNumber: waveNumber||'', agentWaveName: waveName||'' } }, { new: true, upsert: false });
     if (!agent) return res.status(404).json({ error: 'Agent မတွေ့ပါ' });
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
