@@ -20,7 +20,7 @@ app.use(express.json());
 
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const ADMIN_ID     = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://minefrontend-9d5ulgmnh-koedjdyud-8526s-projects.vercel.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://minefrontend.vercel.app';
 const BACKEND_URL  = process.env.BACKEND_URL  || 'https://minebackend-dyyq.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME  || 'winnermine_bot';
 
@@ -686,7 +686,7 @@ app.post('/api/deposit', async (req, res) => {
     const { telegramId, kpayName, transactionId, amount, paymentMethod } = req.body;
     if (!telegramId || !kpayName || !transactionId || !amount)
       return res.status(400).json({ error: 'ကွင်းလပ်များ ဖြည့်ပေးပါ' });
-    if (parseInt(amount) < 500) return res.status(400).json({ error: 'အနည်းဆုံး 500 MMK' });
+    if (parseInt(amount) < 2500) return res.status(400).json({ error: 'အနည်းဆုံး 2,500 MMK ဖြည့်ပါ' });
     const u = await User.findOne({ telegramId: parseInt(telegramId) }).lean();
     if (!u)          return res.status(404).json({ error: 'User not found' });
     if (u.isBanned)  return res.status(403).json({ error: 'ကောင်ပိတ်ဆို့ထားသည်' });
@@ -707,7 +707,7 @@ app.post('/api/withdraw', async (req, res) => {
     if (!telegramId || !kpayName || !kpayNumber || !amount)
       return res.status(400).json({ error: 'ကွင်းလပ်များ ဖြည့်ပေးပါ' });
     const amt = parseInt(amount);
-    if (isNaN(amt) || amt < 2500) return res.status(400).json({ error: 'အနည်းဆုံး 2,500 MMK' });
+    if (isNaN(amt) || amt < 5000) return res.status(400).json({ error: 'အနည်းဆုံး 5,000 MMK ထုတ်ယူနိုင်သည်' });
     const tid = parseInt(telegramId);
     const chk = await User.findOne({ telegramId: tid }).select('balance isBanned firstName username').lean();
     if (!chk)          return res.status(404).json({ error: 'User မတွေ့ပါ' });
@@ -810,8 +810,26 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async (req, res) => {
     );
     if (!dep) return res.status(400).json({ error: 'Deposit မတွေ့ပါ' });
     await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
-    // Deposit commission
+
+    // ── Referral bonus: first deposit ≥ 2500 MMK ──────────────────────────
+    // Normal referrer → +100 MMK | Agent referrer → +200 MMK (+ % commission)
+    const depositor = await User.findOne({ telegramId: dep.userId }).lean();
+    if (depositor?.referredBy && dep.amount >= 2500) {
+      const prevConfirmed = await Deposit.countDocuments({ userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id } });
+      if (prevConfirmed === 0) {
+        const referrer = await User.findOne({ telegramId: depositor.referredBy }).lean();
+        const isAgentReferrer = referrer?.role === 'agent';
+        const bonus = isAgentReferrer ? 200 : 100;
+        await User.findOneAndUpdate({ telegramId: depositor.referredBy }, { $inc: { balance: bonus } });
+        if (bot) bot.telegram.sendMessage(depositor.referredBy,
+          `🎉 သင့် Referral မှ ပထမဆုံး ငွေဖြည့်သောကြောင့် <b>+${bonus} MMK</b> ရရှိပါပြီ!`,
+          { parse_mode: 'HTML' }).catch(() => {});
+      }
+    }
+
+    // % Commission for agents
     creditAgentCommission(dep.userId, dep.amount, 'deposit').catch(() => {});
+
     if (bot) bot.telegram.sendMessage(dep.userId,
       `✅ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု အတည်ပြုပြီး! 🎉`,
       Markup.inlineKeyboard([[Markup.button.webApp('💣 ကစားမည်', FRONTEND_URL)]])).catch(() => {});
@@ -1026,7 +1044,18 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
     await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -dep.amount } });
     await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
 
-    // Deposit commission for agent
+    // ── Referral bonus: agent gets +200 MMK on first deposit ≥ 2500 ─────────
+    if (dep.amount >= 2500) {
+      const prevConfirmed = await Deposit.countDocuments({ userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id } });
+      if (prevConfirmed === 0) {
+        await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: 200 } });
+        if (bot) bot.telegram.sendMessage(agentId,
+          `🎉 Referral မှ ပထမဆုံး ငွေဖြည့်သောကြောင့် <b>+200 MMK</b> Bonus ရရှိပါပြီ!`,
+          { parse_mode: 'HTML' }).catch(() => {});
+      }
+    }
+
+    // % Deposit commission for agent
     const agentDoc = await Agent.findOne({ telegramId: agentId }).lean();
     if (agentDoc?.depositCommission > 0) {
       const commission = Math.floor(dep.amount * agentDoc.depositCommission / 100);
@@ -1034,7 +1063,7 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
         await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: commission } });
         await Agent.findOneAndUpdate({ telegramId: agentId }, { $inc: { totalCommissionEarned: commission } });
         if (bot) bot.telegram.sendMessage(agentId,
-          `💰 <b>Deposit Commission!</b>\n+${commission.toLocaleString()} MMK (${agentDoc.depositCommission}%)`,
+          `💰 <b>Deposit Commission!</b>\n+${commission.toLocaleString()} MMK (${agentDoc.depositCommission}% of ${dep.amount.toLocaleString()})`,
           { parse_mode: 'HTML' }).catch(() => {});
       }
     }
