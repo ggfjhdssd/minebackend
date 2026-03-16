@@ -24,6 +24,9 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://minefrontend.vercel.ap
 const BACKEND_URL  = process.env.BACKEND_URL  || 'https://minebackend-dyyq.onrender.com';
 const BOT_USERNAME = process.env.BOT_USERNAME  || 'winnermine_bot';
 
+// 3 days TTL constant
+const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+
 // ===== MongoDB Dual Connection =====
 let isConnected = false;
 async function connectDB() {
@@ -63,6 +66,10 @@ const userSchema = new mongoose.Schema({
 userSchema.index({ telegramId: 1 });
 userSchema.index({ referralCode: 1 });
 
+// ── Deposit Schema ──────────────────────────────────────────────────────────
+// expireAt is set on ALL records at creation (pending → 3 days from now).
+// When confirmed/rejected, expireAt resets to 3 days from processedAt.
+// MongoDB TTL index fires at expireAt=0 meaning "expire when this date passes".
 const depositSchema = new mongoose.Schema({
   userId:        { type: Number, required: true },
   kpayName:      String,
@@ -71,14 +78,17 @@ const depositSchema = new mongoose.Schema({
   paymentMethod: { type: String, enum: ['kpay','wave'], default: 'kpay' },
   status:        { type: String, enum: ['pending','confirming','confirmed','rejected'], default: 'pending' },
   processedBy:   { type: String, enum: ['admin','agent'], default: 'admin' },
+  rejectionNote: { type: String, default: '' },
   createdAt:     { type: Date, default: Date.now },
   processedAt:   Date,
-  expireAt:      { type: Date, default: null }
+  expireAt:      { type: Date, default: () => new Date(Date.now() + THREE_DAYS_MS) }
 });
 depositSchema.index({ transactionId: 1 });
 depositSchema.index({ status: 1 });
+depositSchema.index({ userId: 1 });
 depositSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
 
+// ── Withdrawal Schema ───────────────────────────────────────────────────────
 const withdrawalSchema = new mongoose.Schema({
   userId:        { type: Number, required: true },
   kpayName:      String,
@@ -86,11 +96,13 @@ const withdrawalSchema = new mongoose.Schema({
   amount:        { type: Number, required: true },
   paymentMethod: { type: String, enum: ['kpay','wave'], default: 'kpay' },
   status:        { type: String, enum: ['pending','confirmed','rejected'], default: 'pending' },
+  rejectionNote: { type: String, default: '' },
   createdAt:     { type: Date, default: Date.now },
   processedAt:   Date,
-  expireAt:      { type: Date, default: null }
+  expireAt:      { type: Date, default: () => new Date(Date.now() + THREE_DAYS_MS) }
 });
 withdrawalSchema.index({ status: 1 });
+withdrawalSchema.index({ userId: 1 });
 withdrawalSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
 
 // Mines Game Schema
@@ -99,8 +111,8 @@ const minesGameSchema = new mongoose.Schema({
   userId:           { type: Number, required: true },
   betAmount:        { type: Number, required: true },
   bombCount:        { type: Number, required: true },
-  serverSeed:       { type: String, required: true }, // revealed after game ends
-  hashedServerSeed: { type: String, required: true }, // shown before & during game
+  serverSeed:       { type: String, required: true },
+  hashedServerSeed: { type: String, required: true },
   clientSeed:       { type: String, required: true },
   bombPositions:    [Number],
   revealedCells:    { type: [Number], default: [] },
@@ -108,7 +120,7 @@ const minesGameSchema = new mongoose.Schema({
   status:           { type: String, enum: ['active','cashout','exploded'], default: 'active' },
   winAmount:        { type: Number, default: 0 },
   explodedCell:     { type: Number, default: null },
-  createdAt:        { type: Date, default: Date.now, expires: 86400 * 7 }
+  createdAt:        { type: Date, default: Date.now, expires: 86400 * 3 }   // 3 days
 });
 minesGameSchema.index({ userId: 1, status: 1 });
 minesGameSchema.index({ gameId: 1 });
@@ -128,15 +140,14 @@ const redeemCodeSchema = new mongoose.Schema({
 });
 redeemCodeSchema.index({ code: 1 });
 
-// Agent Schema — Percentage Commission (no more Box Milestones)
 const agentSchema = new mongoose.Schema({
   telegramId:            { type: Number, required: true, unique: true },
   referralCode:          { type: String },
   agentKpayNumber:       { type: String, default: '' },
   agentKpayName:         { type: String, default: '' },
   hasWave:               { type: Boolean, default: false },
-  depositCommission:     { type: Number, default: 0, min: 0, max: 50 },  // % of each deposit
-  turnoverCommission:    { type: Number, default: 0, min: 0, max: 10 },  // % of each bet
+  depositCommission:     { type: Number, default: 0, min: 0, max: 50 },
+  turnoverCommission:    { type: Number, default: 0, min: 0, max: 10 },
   totalCommissionEarned: { type: Number, default: 0 },
   isActive:              { type: Boolean, default: true },
   createdAt:             { type: Date, default: Date.now }
@@ -187,16 +198,10 @@ async function setSetting(key, value) {
 // ===== Mines Game Core Logic =====
 const TOTAL_TILES = 25;
 
-/**
- * Provably Fair bomb placement using HMAC-SHA256 + Fisher-Yates shuffle.
- * serverSeed is the secret; clientSeed + gameId is the public input.
- */
 function generateBombPositions(serverSeed, clientSeed, bombCount) {
   const combined = `${clientSeed}`;
   const hmac = crypto.createHmac('sha256', serverSeed).update(combined).digest('hex');
-  // Build tile array [0..24]
   const positions = Array.from({length: TOTAL_TILES}, (_, i) => i);
-  // Seeded Fisher-Yates
   for (let i = TOTAL_TILES - 1; i > 0; i--) {
     const offset = (i * 4) % (hmac.length - 4);
     const rand = parseInt(hmac.slice(offset, offset + 4), 16);
@@ -206,18 +211,13 @@ function generateBombPositions(serverSeed, clientSeed, bombCount) {
   return positions.slice(0, bombCount).sort((a, b) => a - b);
 }
 
-/**
- * Multiplier after `revealed` safe cells:
- *   fairMult = ∏(i=0..revealed-1) [ (total-i) / (total-bombs-i) ]
- *   payoutMult = fairMult × 0.95  (5% house edge / RTP 95%)
- */
 function calcMultiplier(bombCount, revealed) {
   if (revealed === 0) return 1.00;
   let mult = 1;
   for (let i = 0; i < revealed; i++) {
     mult *= (TOTAL_TILES - i) / (TOTAL_TILES - bombCount - i);
   }
-  mult *= 0.95; // house edge
+  mult *= 0.95;
   return Math.max(1.01, Math.round(mult * 100) / 100);
 }
 
@@ -345,7 +345,7 @@ if (BOT_TOKEN) {
       const link = `https://t.me/${BOT_USERNAME}?start=${u.referralCode}`;
       await ctx.reply(
         `🔗 <b>Referral Link</b>\n\n<code>${link}</code>`,
-        { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.url('📤 Share', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('💣 Mines Game ကစားပြီးငွေရှာကြစို့!')}`)]]) }
+        { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.url('📤 Share', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('💣 Mines Game ကစားပြီးငွေရှာကြစို့!')}`)]])}
       ).catch(() => {});
     } catch(e) {}
   });
@@ -443,7 +443,6 @@ app.get('/api/user/:id', async (req, res) => {
 
 // ===== Mines Game API =====
 
-// POST /api/mines/start — begin a new game
 app.post('/api/mines/start', async (req, res) => {
   try {
     const { telegramId, betAmount, bombCount, clientSeed: userClientSeed } = req.body;
@@ -461,18 +460,15 @@ app.post('/api/mines/start', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User မတွေ့ပါ' });
     if (user.balance < bet) return res.status(400).json({ error: `လက်ကျန်ငွေ မလုံလောက်ပါ (ကျန်: ${user.balance.toLocaleString()} MMK)` });
 
-    // Block duplicate active game
     const existing = await MinesGame.findOne({ userId: tid, status: 'active' }).lean();
     if (existing) return res.status(400).json({ error: 'ဂိမ်း ဆော့နေဆဲ ဖြစ်သည်', gameId: existing.gameId });
 
-    // Provably Fair seeds
     const serverSeed       = crypto.randomBytes(32).toString('hex');
     const hashedServerSeed = crypto.createHash('sha256').update(serverSeed).digest('hex');
     const clientSeed       = userClientSeed || crypto.randomBytes(8).toString('hex');
 
     const bombPositions = generateBombPositions(serverSeed, clientSeed, bombs);
 
-    // Atomic deduct
     const updated = await User.findOneAndUpdate(
       { telegramId: tid, balance: { $gte: bet }, isBanned: { $ne: true } },
       { $inc: { balance: -bet } },
@@ -483,7 +479,6 @@ app.post('/api/mines/start', async (req, res) => {
     const gameId = genGameId();
     await new MinesGame({ gameId, userId: tid, betAmount: bet, bombCount: bombs, serverSeed, hashedServerSeed, clientSeed, bombPositions, revealedCells: [], currentMultiplier: 1, status: 'active', winAmount: 0 }).save();
 
-    // Turnover commission (async, non-blocking)
     creditAgentCommission(tid, bet, 'turnover').catch(() => {});
 
     res.json({
@@ -495,7 +490,6 @@ app.post('/api/mines/start', async (req, res) => {
   } catch(e) { console.error('mines/start err:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-// POST /api/mines/reveal — open a tile  (Dynamic 5% House Edge)
 app.post('/api/mines/reveal', async (req, res) => {
   try {
     const { gameId, cellIndex, telegramId } = req.body;
@@ -510,25 +504,16 @@ app.post('/api/mines/reveal', async (req, res) => {
     if (!game) return res.status(404).json({ error: 'Active game မတွေ့ပါ' });
     if (game.revealedCells.includes(cell)) return res.status(400).json({ error: 'Cell already opened' });
 
-    // ── Dynamic House Edge ────────────────────────────────────────────────
-    // 5% flat chance per click that this tile is a bomb (regardless of board).
-    // If triggered, pick a random unrevealed cell (not the clicked cell) to mark
-    // as the "real" bomb position so the reveal looks consistent to the client.
     const HOUSE_EDGE_PCT = 0.05;
     const dynamicBomb = Math.random() < HOUSE_EDGE_PCT;
-
-    // Also honour any pre-placed bomb on this cell from the original board
     const presetBomb = game.bombPositions.includes(cell);
-
     const isBomb = dynamicBomb || presetBomb;
 
     if (isBomb) {
-      // If triggered dynamically, make sure the clicked cell appears in bombPositions
       if (!game.bombPositions.includes(cell)) {
         game.bombPositions.push(cell);
       }
 
-      // 💣 EXPLODED
       game.status       = 'exploded';
       game.explodedCell = cell;
       game.winAmount    = 0;
@@ -547,15 +532,12 @@ app.post('/api/mines/reveal', async (req, res) => {
         status: 'exploded', winAmount: 0
       });
     }
-    // ─────────────────────────────────────────────────────────────────────
 
-    // 💵 DIAMOND
     game.revealedCells.push(cell);
     const revealed = game.revealedCells.length;
     game.currentMultiplier = calcMultiplier(game.bombCount, revealed);
     const totalSafe = TOTAL_TILES - game.bombCount;
 
-    // Auto-cashout when all safe tiles revealed
     if (revealed >= totalSafe) {
       const winAmount = Math.floor(game.betAmount * game.currentMultiplier);
       game.status    = 'cashout';
@@ -589,7 +571,6 @@ app.post('/api/mines/reveal', async (req, res) => {
   } catch(e) { console.error('mines/reveal err:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-// POST /api/mines/cashout — collect winnings
 app.post('/api/mines/cashout', async (req, res) => {
   try {
     const { gameId, telegramId } = req.body;
@@ -623,7 +604,6 @@ app.post('/api/mines/cashout', async (req, res) => {
   } catch(e) { console.error('mines/cashout err:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-// GET /api/mines/current/:telegramId — resume active game
 app.get('/api/mines/current/:telegramId', async (req, res) => {
   try {
     const tid  = parseInt(req.params.telegramId);
@@ -643,7 +623,6 @@ app.get('/api/mines/current/:telegramId', async (req, res) => {
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// GET /api/mines/verify/:gameId — Provably Fair verification
 app.get('/api/mines/verify/:gameId', async (req, res) => {
   try {
     const game = await MinesGame.findOne({ gameId: req.params.gameId }).lean();
@@ -670,7 +649,6 @@ app.get('/api/mines/verify/:gameId', async (req, res) => {
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// GET /api/mines/history/:telegramId — last 20 games
 app.get('/api/mines/history/:telegramId', async (req, res) => {
   try {
     const games = await MinesGame.find({ userId: parseInt(req.params.telegramId), status: { $ne: 'active' } })
@@ -693,6 +671,7 @@ app.post('/api/deposit', async (req, res) => {
     const dup = await Deposit.findOne({ transactionId }).lean();
     if (dup)         return res.status(400).json({ error: 'Transaction ID ကို အသုံးပြုပြီးသည်' });
     const method = paymentMethod === 'wave' ? 'wave' : 'kpay';
+    // expireAt auto-set by schema default to 3 days from now
     const dep = await new Deposit({ userId: u.telegramId, kpayName, transactionId, amount: parseInt(amount), paymentMethod: method }).save();
     if (bot) bot.telegram.sendMessage(ADMIN_ID,
       `💰 *ငွေသွင်း*\n👤 ${u.firstName||u.username} (${u.telegramId})\n💵 ${parseInt(amount).toLocaleString()} ကျပ်\n📱 ${method === 'wave' ? '🌊 Wave' : '📱 KPay'}\n📝 ${kpayName}\n🔢 \`${transactionId}\``,
@@ -714,6 +693,7 @@ app.post('/api/withdraw', async (req, res) => {
     if (chk.isBanned)  return res.status(403).json({ error: '🚫 ကောင်ပိတ်ဆို့ထားသည်' });
     if (chk.balance < amt) return res.status(400).json({ error: `လက်ကျန်ငွေ မလုံလောက်ပါ (ကျန်: ${chk.balance.toLocaleString()} MMK)` });
     const method = paymentMethod === 'wave' ? 'wave' : 'kpay';
+    // expireAt auto-set by schema default to 3 days from now
     let wd;
     try { wd = await new Withdrawal({ userId: tid, kpayName, kpayNumber, amount: amt, paymentMethod: method }).save(); }
     catch { return res.status(500).json({ error: 'Record သိမ်းမရပါ' }); }
@@ -783,36 +763,51 @@ app.post('/api/admin/maintenance', isAdmin, async (req, res) => {
   res.json({ success: true, maintenance: !!req.body.enabled });
 });
 
+// ── Deposits (with status filter: pending / confirmed / rejected) ──────────
 app.get('/api/admin/deposits', isAdmin, async (req, res) => {
   try {
-    const agents = await User.find({ role: 'agent' }).select('telegramId').lean();
-    const agentIds = agents.map(a => a.telegramId);
-    const agentReferredIds = agentIds.length
-      ? (await User.find({ referredBy: { $in: agentIds } }).select('telegramId').lean()).map(u => u.telegramId)
-      : [];
-    const query = { status: req.query.status || 'pending' };
-    if (agentReferredIds.length) query.userId = { $nin: agentReferredIds };
-    const deps = await Deposit.find(query).sort({ createdAt: -1 }).limit(50).lean();
+    const status  = req.query.status || 'pending';
+    const page    = parseInt(req.query.page) || 1;
+    const limit   = 30;
+    const query   = { status };
+
+    // Exclude agent-managed deposits from admin list when pending
+    if (status === 'pending') {
+      const agents = await User.find({ role: 'agent' }).select('telegramId').lean();
+      const agentIds = agents.map(a => a.telegramId);
+      if (agentIds.length) {
+        const agentReferredIds = (await User.find({ referredBy: { $in: agentIds } }).select('telegramId').lean()).map(u => u.telegramId);
+        if (agentReferredIds.length) query.userId = { $nin: agentReferredIds };
+      }
+    }
+
+    const [deps, total] = await Promise.all([
+      Deposit.find(query).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean(),
+      Deposit.countDocuments(query)
+    ]);
     const out = await Promise.all(deps.map(async d => {
       const u = await User.findOne({ telegramId: d.userId }).select('firstName username').lean();
       return { ...d, userName: u?.firstName || u?.username || String(d.userId) };
     }));
-    res.json(out);
+    res.json({ deposits: out, total, pages: Math.ceil(total/limit) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/admin/deposits/:id/confirm', isAdmin, async (req, res) => {
   try {
+    const now = new Date();
     const dep = await Deposit.findOneAndUpdate(
       { _id: req.params.id, status: 'pending' },
-      { $set: { status: 'confirmed', processedAt: new Date(), expireAt: new Date(Date.now() + 72*3600000) } },
+      { $set: {
+        status: 'confirmed',
+        processedAt: now,
+        expireAt: new Date(now.getTime() + THREE_DAYS_MS)  // reset TTL from processedAt
+      }},
       { new: true }
     );
     if (!dep) return res.status(400).json({ error: 'Deposit မတွေ့ပါ' });
     await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
 
-    // ── Referral bonus: first deposit ≥ 2500 MMK ──────────────────────────
-    // Normal referrer → +100 MMK | Agent referrer → +200 MMK (+ % commission)
     const depositor = await User.findOne({ telegramId: dep.userId }).lean();
     if (depositor?.referredBy && dep.amount >= 2500) {
       const prevConfirmed = await Deposit.countDocuments({ userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id } });
@@ -827,7 +822,6 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async (req, res) => {
       }
     }
 
-    // % Commission for agents
     creditAgentCommission(dep.userId, dep.amount, 'deposit').catch(() => {});
 
     if (bot) bot.telegram.sendMessage(dep.userId,
@@ -840,8 +834,11 @@ app.post('/api/admin/deposits/:id/confirm', isAdmin, async (req, res) => {
 app.post('/api/admin/deposits/:id/reject', isAdmin, async (req, res) => {
   try {
     const { reason } = req.body;
+    const now = new Date();
     const dep = await Deposit.findByIdAndUpdate(req.params.id,
-      { status: 'rejected', processedAt: new Date(), expireAt: new Date(Date.now() + 72*3600000) }, { new: true });
+      { status: 'rejected', processedAt: now, rejectionNote: reason||'',
+        expireAt: new Date(now.getTime() + THREE_DAYS_MS) },
+      { new: true });
     if (!dep) return res.status(404).json({ error: 'မတွေ့ပါ' });
     if (bot) bot.telegram.sendMessage(dep.userId,
       `❌ ငွေ ${dep.amount.toLocaleString()} ကျပ် သွင်းမှု ပယ်ချပြီ\nTxn: ${dep.transactionId}${reason ? `\n${reason}` : ''}`).catch(() => {});
@@ -849,22 +846,34 @@ app.post('/api/admin/deposits/:id/reject', isAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Withdrawals (with status filter) ──────────────────────────────────────
 app.get('/api/admin/withdrawals', isAdmin, async (req, res) => {
   try {
-    const wds = await Withdrawal.find({ status: req.query.status || 'pending' }).sort({ createdAt: -1 }).limit(50).lean();
+    const status = req.query.status || 'pending';
+    const page   = parseInt(req.query.page) || 1;
+    const limit  = 30;
+    const [wds, total] = await Promise.all([
+      Withdrawal.find({ status }).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean(),
+      Withdrawal.countDocuments({ status })
+    ]);
     const out = await Promise.all(wds.map(async w => {
       const u = await User.findOne({ telegramId: w.userId }).select('firstName username balance').lean();
       return { ...w, userName: u?.firstName || u?.username || String(w.userId), userBalance: u?.balance };
     }));
-    res.json(out);
+    res.json({ withdrawals: out, total, pages: Math.ceil(total/limit) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async (req, res) => {
   try {
+    const now = new Date();
     const wd = await Withdrawal.findOneAndUpdate(
       { _id: req.params.id, status: 'pending' },
-      { $set: { status: 'confirmed', processedAt: new Date(), expireAt: new Date(Date.now() + 72*3600000) } },
+      { $set: {
+        status: 'confirmed',
+        processedAt: now,
+        expireAt: new Date(now.getTime() + THREE_DAYS_MS)
+      }},
       { new: true }
     );
     if (!wd) return res.status(400).json({ error: 'Withdrawal မတွေ့ပါ' });
@@ -876,12 +885,16 @@ app.post('/api/admin/withdrawals/:id/confirm', isAdmin, async (req, res) => {
 
 app.post('/api/admin/withdrawals/:id/reject', isAdmin, async (req, res) => {
   try {
+    const { reason } = req.body;
     const wd = await Withdrawal.findById(req.params.id);
     if (!wd || wd.status !== 'pending') return res.status(400).json({ error: 'ပြင်ဆင်မရပါ' });
-    wd.status = 'rejected'; wd.processedAt = new Date(); wd.expireAt = new Date(Date.now() + 72*3600000);
+    const now = new Date();
+    wd.status = 'rejected'; wd.processedAt = now; wd.rejectionNote = reason||'';
+    wd.expireAt = new Date(now.getTime() + THREE_DAYS_MS);
     await wd.save();
     await User.findOneAndUpdate({ telegramId: wd.userId }, { $inc: { balance: wd.amount } });
-    if (bot) bot.telegram.sendMessage(wd.userId, `❌ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု ပယ်ချပြီး ငွေပြန်အမ်းပြီ`).catch(() => {});
+    if (bot) bot.telegram.sendMessage(wd.userId,
+      `❌ ငွေ ${wd.amount.toLocaleString()} ကျပ် ထုတ်မှု ပယ်ချပြီး ငွေပြန်အမ်းပြီ${reason ? `\n${reason}` : ''}`).catch(() => {});
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1006,20 +1019,24 @@ app.get('/api/agent/deposits', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
     const referredUsers = await User.find({ referredBy: agentId }).select('telegramId firstName username').lean();
-    if (!referredUsers.length) return res.json([]);
+    if (!referredUsers.length) return res.json({ deposits: [], total: 0 });
     const referredIds = referredUsers.map(u => u.telegramId);
     const userMap = {};
     referredUsers.forEach(u => { userMap[u.telegramId] = u.firstName || u.username || `User${u.telegramId}`; });
-    const deps = await Deposit.find({ userId: { $in: referredIds }, status: req.query.status || 'pending' })
-      .sort({ createdAt: -1 }).limit(50).lean();
-    res.json(deps.map(d => ({ ...d, userName: userMap[d.userId] || String(d.userId) })));
+    const status = req.query.status || 'pending';
+    const page   = parseInt(req.query.page) || 1;
+    const limit  = 30;
+    const [deps, total] = await Promise.all([
+      Deposit.find({ userId: { $in: referredIds }, status }).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean(),
+      Deposit.countDocuments({ userId: { $in: referredIds }, status })
+    ]);
+    res.json({ deposits: deps.map(d => ({ ...d, userName: userMap[d.userId] || String(d.userId) })), total, pages: Math.ceil(total/limit) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
-    // Atomic lock to prevent double-confirm
     const dep = await Deposit.findOneAndUpdate(
       { _id: req.params.id, status: 'pending' },
       { $set: { status: 'confirming' } },
@@ -1040,11 +1057,14 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
       await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'pending' } });
       return res.status(402).json({ error: `လက်ကျန်ငွေ မလောက်ပါ (ကျန်: ${(agentFresh?.balance||0).toLocaleString()})`, insufficientBalance: true, agentBalance: agentFresh?.balance||0, required: dep.amount });
     }
-    await Deposit.findByIdAndUpdate(dep._id, { $set: { status: 'confirmed', processedAt: new Date(), processedBy: 'agent', expireAt: new Date(Date.now() + 72*3600000) } });
+    const now = new Date();
+    await Deposit.findByIdAndUpdate(dep._id, { $set: {
+      status: 'confirmed', processedAt: now, processedBy: 'agent',
+      expireAt: new Date(now.getTime() + THREE_DAYS_MS)
+    }});
     await User.findOneAndUpdate({ telegramId: agentId }, { $inc: { balance: -dep.amount } });
     await User.findOneAndUpdate({ telegramId: dep.userId }, { $inc: { balance: dep.amount } });
 
-    // ── Referral bonus: agent gets +200 MMK on first deposit ≥ 2500 ─────────
     if (dep.amount >= 2500) {
       const prevConfirmed = await Deposit.countDocuments({ userId: dep.userId, status: 'confirmed', _id: { $ne: dep._id } });
       if (prevConfirmed === 0) {
@@ -1055,7 +1075,6 @@ app.post('/api/agent/deposits/:id/confirm', isAgent, async (req, res) => {
       }
     }
 
-    // % Deposit commission for agent
     const agentDoc = await Agent.findOne({ telegramId: agentId }).lean();
     if (agentDoc?.depositCommission > 0) {
       const commission = Math.floor(dep.amount * agentDoc.depositCommission / 100);
@@ -1079,9 +1098,14 @@ app.post('/api/agent/deposits/:id/reject', isAgent, async (req, res) => {
   try {
     const agentId = req.agentUser.telegramId;
     const { reason } = req.body;
+    const now = new Date();
     const dep = await Deposit.findOneAndUpdate(
       { _id: req.params.id, status: 'pending' },
-      { $set: { status: 'rejected', processedAt: new Date(), processedBy: 'agent', expireAt: new Date(Date.now() + 72*3600000) } },
+      { $set: {
+        status: 'rejected', processedAt: now, processedBy: 'agent',
+        rejectionNote: reason||'',
+        expireAt: new Date(now.getTime() + THREE_DAYS_MS)
+      }},
       { new: true }
     );
     if (!dep) return res.status(400).json({ error: 'ပြင်ဆင်မရပါ' });
@@ -1176,7 +1200,6 @@ app.post('/api/admin/users/:tid/make-agent', isAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Set agent commission percentages
 app.post('/api/admin/agents/:tid/commission', isAdmin, async (req, res) => {
   try {
     const tid = parseInt(req.params.tid);
@@ -1266,7 +1289,7 @@ app.delete('/api/admin/redeem/:id', isAdmin, async (req, res) => {
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== Self-Ping (keep Render alive) =====
+// ===== Self-Ping =====
 setInterval(() => {
   try { https.get(`${BACKEND_URL}/health`, () => {}).on('error', () => {}); } catch {}
 }, 5 * 60 * 1000);
